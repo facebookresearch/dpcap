@@ -1,0 +1,292 @@
+diff --git a/logistic_eval.py b/logistic_eval.py
+index 1d9f1c4..1e7af93 100644
+--- a/logistic_eval.py
++++ b/logistic_eval.py
+@@ -19,6 +19,12 @@ import src.deit as deit
+ from src.data_manager import (
+     init_data,
+ )
++import models_vit
++import sys
++sys.path.insert(0, '..')
++import models_mae
++#import models_mae_img2text
++
+ 
+ logging.basicConfig()
+ logger = logging.getLogger()
+@@ -44,6 +50,7 @@ parser.add_argument(
+ parser.add_argument(
+     '--preload', action='store_true',
+     help='whether to preload embs if possible')
++parser.set_defaults(preload=True)
+ parser.add_argument(
+     '--fname', type=str,
+     help='model architecture')
+@@ -75,6 +82,14 @@ parser.add_argument(
+     default=None,
+     help='name of dataset to evaluate on')
+ 
++parser.add_argument(
++    '--model', type=str,
++    default='model',
++    choices=["model", "model_ema"])
++parser.add_argument(
++    '--max_text_length', type=int,
++    default=40)
++
+ logging.basicConfig()
+ logger = logging.getLogger()
+ logger.setLevel(logging.INFO)
+@@ -100,8 +115,9 @@ def main(
+     penalty='l2',
+     model_name=None,
+     normalize=True,
+-    device_str='cuda:0'
+-):
++    device_str='cuda:0',
++    max_text_length=40
++):  
+     device = torch.device(device_str)
+     if 'cuda' in device_str:
+         torch.cuda.set_device(device)
+@@ -146,7 +162,8 @@ def main(
+     encoder = init_model(
+         device=device,
+         pretrained=pretrained,
+-        model_name=model_name)
++        model_name=model_name,
++        max_text_length=max_text_length)
+     encoder.eval()
+ 
+     # -- If train embeddings already computed, load file, otherwise, compute
+@@ -169,22 +186,16 @@ def main(
+         }, train_embs_path)
+         logger.info(f'saved train embs of shape {embs.shape}')
+     # -- Normalize embeddings
+-    cyan.preprocess(embs, normalize=normalize, columns=False, centering=True)
++    from cyanure.data_processing import preprocess
++    preprocess(embs, normalize=normalize, columns=False, centering=True)
+ 
+     # -- Fit Logistic Regression Classifier
+-    classifier = cyan.MultiClassifier(loss='multiclass-logistic', penalty=penalty, fit_intercept=False)
++    from cyanure.estimators import Classifier as MultiClassifier
+     lambd /= len(embs)
++    classifier = MultiClassifier(loss='multiclass-logistic', penalty=penalty, fit_intercept=False, lambda_1=lambd,lambda_2=lambd,)
+     classifier.fit(
+         embs.numpy(),
+-        labs.numpy(),
+-        it0=10,
+-        lambd=lambd,
+-        lambd2=lambd,
+-        nthreads=-1,
+-        tol=1e-3,
+-        solver='auto',
+-        seed=0,
+-        max_epochs=300)
++        labs.numpy())
+ 
+     # -- Evaluate and log
+     train_score = classifier.score(embs.numpy(), labs.numpy())
+@@ -211,7 +222,8 @@ def main(
+         }, test_embs_path)
+         logger.info(f'saved test embs of shape {test_embs.shape}')
+     # -- Normalize embeddings
+-    cyan.preprocess(test_embs, normalize=normalize, columns=False, centering=True)
++    from cyanure.data_processing import preprocess
++    preprocess(test_embs, normalize=normalize, columns=False, centering=True)
+ 
+     # -- Evaluate and log
+     test_score = classifier.score(test_embs.numpy(), test_labs.numpy())
+@@ -237,9 +249,9 @@ def make_embeddings(
+         for itr, (imgs, labels) in enumerate(data_loader):
+             imgs = imgs.to(device)
+             with torch.no_grad():
+-                z = encoder.forward_blocks(imgs, blocks, mask_frac).cpu()
++                z = encoder.linear_prob_forward(imgs).cpu()
+             labels = labels.cpu()
+-            z_mem.append(z)
++            z_mem.append(z.mean(dim=1))
+             l_mem.append(labels)
+             if itr % 50 == 0:
+                 logger.info(f'[{itr}/{ipe}]')
+@@ -280,13 +292,19 @@ def init_model(
+     device,
+     pretrained,
+     model_name,
++    max_text_length
+ ):
+-    encoder = deit.__dict__[model_name]()
+-    encoder.fc = None
+-    encoder.to(device)
+-    encoder = load_pretrained(encoder=encoder, pretrained=pretrained)
++    if "ViP" in args.pretrained or "VIP" in args.pretrained or "vip" in args.pretrained:
++        print("ViP loading")
++        model = models_vit.__dict__[args.model_name]()
++    else:
++        model = models_mae.__dict__[args.model_name](text_max_length=max_text_length)
++    device = torch.device("cuda")
++    checkpoint = torch.load(args.pretrained+args.fname, map_location='cpu')
++    model.load_state_dict(checkpoint[args.model],strict=False)
++    model.to(device)
+ 
+-    return encoder
++    return model
+ 
+ 
+ if __name__ == '__main__':
+@@ -307,5 +325,6 @@ if __name__ == '__main__':
+         image_folder=args.image_folder,
+         model_name=args.model_name,
+         normalize=args.normalize,
+-        device_str=args.device
++        device_str=args.device,
++        max_text_length=args.max_text_length
+     )
+diff --git a/models_vit.py b/models_vit.py
+new file mode 100644
+index 0000000..18f1330
+--- /dev/null
++++ b/models_vit.py
+@@ -0,0 +1,99 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++# All rights reserved.
++
++# This source code is licensed under the license found in the
++# LICENSE file in the root directory of this source tree.
++# --------------------------------------------------------
++# References:
++# timm: https://github.com/rwightman/pytorch-image-models/tree/master/timm
++# DeiT: https://github.com/facebookresearch/deit
++# --------------------------------------------------------
++
++from functools import partial
++
++import torch
++import torch.nn as nn
++
++import timm.models.vision_transformer
++
++
++class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
++    """ Vision Transformer with support for global average pooling
++    """
++    def __init__(self, global_pool=False, lp_num_layers=6, **kwargs):
++        super(VisionTransformer, self).__init__(**kwargs)
++
++        self.global_pool = global_pool
++        self.lp_num_layers = lp_num_layers
++        if self.global_pool:
++            norm_layer = kwargs['norm_layer']
++            embed_dim = kwargs['embed_dim']
++            self.fc_norm = norm_layer(embed_dim)
++
++            del self.norm  # remove the original norm
++
++    def forward_features(self, x):
++        B = x.shape[0]
++        x = self.patch_embed(x)
++
++        cls_tokens = self.cls_token.expand(B, -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
++        x = torch.cat((cls_tokens, x), dim=1)
++        x = x + self.pos_embed
++        x = self.pos_drop(x)
++
++        feature_list = []
++        idx_block = 0
++
++        for blk in self.blocks:
++            x = blk(x)
++            idx_block += 1
++            if idx_block > (len(self.blocks) - self.lp_num_layers):
++                if self.global_pool:
++                    feature_list.append(x[:, 1:, :].mean(dim=1))
++                else:
++                    feature_list.append(x[:, 0])
++        # concate features
++        outcome = torch.cat(feature_list, 1)
++
++        return outcome
++
++    def forward_head(self, x, pre_logits: bool = False):
++        return x if pre_logits else self.head(x)
++    def linear_prob_forward(self, x):
++        B = x.shape[0]
++        x = self.patch_embed(x)
++
++        cls_tokens = self.cls_token.expand(B, -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
++        x = torch.cat((cls_tokens, x), dim=1)
++        x = x + self.pos_embed
++        x = self.pos_drop(x)
++        for blk in self.blocks:
++            x = blk(x)
++        return x
++
++
++# def vit_small_patch16(**kwargs):
++#     model = VisionTransformer(
++#         patch_size=16, embed_dim=576, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=False,
++#         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
++#     return model
++
++def vit_base_patch16(**kwargs):
++    model = VisionTransformer(
++        patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
++        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
++    return model
++
++
++def vit_large_patch16(**kwargs):
++    model = VisionTransformer(
++        patch_size=16, embed_dim=1024, depth=24, num_heads=16, mlp_ratio=4, qkv_bias=True,
++        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
++    return model
++
++
++def vit_huge_patch14(**kwargs):
++    model = VisionTransformer(
++        patch_size=14, embed_dim=1280, depth=32, num_heads=16, mlp_ratio=4, qkv_bias=True,
++        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
++    return model
+\ No newline at end of file
+diff --git a/random_images.py b/random_images.py
+new file mode 100644
+index 0000000..1f0fa19
+--- /dev/null
++++ b/random_images.py
+@@ -0,0 +1,14 @@
++import os
++import numpy as np
++l = []
++n = 10
++path = IMAGENET_PATH
++
++for dir in os.listdir(path):
++    for i in range(n):
++        for img_name in os.listdir(path+"/"+dir):
++            l.append(img_name)
++
++with open("subset10.txt", "w") as output:
++    for img_name in l:
++        output.write(img_name+ '\n')
+\ No newline at end of file
+diff --git a/run_linear_prob.sh b/run_linear_prob.sh
+new file mode 100644
+index 0000000..e5be281
+--- /dev/null
++++ b/run_linear_prob.sh
+@@ -0,0 +1,14 @@
++
++python logistic_eval.py \
++  --subset-path imagenet_subsets1/2imgs_class.txt \
++  --root-path /datasets01/ \
++  --image-folder DATASET_PATH \
++  --device cuda:0 \
++  --pretrained "../checkpoints/DP-Cap/"\
++  --fname "checkpoint-6.pth" \
++  --model-name "mae_vit_base_patch16_autoregressive_nobias" \
++  --model "model"\
++  --penalty l2 \
++  --lambd 0.0025 \
++  --max_text_length 77
++

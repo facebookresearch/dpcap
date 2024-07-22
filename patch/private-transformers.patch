@@ -1,0 +1,735 @@
+diff --git a/private_transformers/privacy_engine.py b/private_transformers/privacy_engine.py
+index c9f4132..8968cef 100644
+--- a/private_transformers/privacy_engine.py
++++ b/private_transformers/privacy_engine.py
+@@ -19,7 +19,6 @@ Design mostly based on Opacus with the exception that `.step` and `virtual_step`
+ takes in per-example losses, which should not be called with `.backward()` by
+ the user.
+ """
+-
+ import collections
+ import logging
+ import math
+@@ -48,23 +47,26 @@ class PrivacyEngine(object):
+ 
+     def __init__(
+         self,
+-        module: nn.Module,
++        module,
+         *,
+         batch_size: int,
+-        sample_size: int,
+         max_grad_norm: float,
++        distributed,
++        rank: int=0,
++        sample_size: int =1000000,
+         epochs: Optional[Union[int, float]] = None,
+         noise_multiplier: Optional[float] = None,
+-        target_epsilon: Optional[float] = None,
+         target_delta: Optional[float] = None,
+         alphas: Sequence[float] = accounting_manager.DEFAULT_ALPHAS,
+         record_snr: bool = True,
+         named_params: Optional[Sequence] = None,
+-        numerical_stability_constant=1e-6,
++        numerical_stability_constant=1e-4,
+         clipping_mode=ClippingMode.default,
+-        accounting_mode="rdp",
+         eps_error=0.05,
+         skip_checks=False,
++        exlude_layer=None,
++        scaler = None,
++        amp_set_nans_to_zero = False,
+         **unused_kwargs,
+     ):
+         """Initialize the engine.
+@@ -78,8 +80,6 @@ class PrivacyEngine(object):
+             max_grad_norm: The maximum 2-norm for gradient clipping.
+             epochs: The number of epochs for training.
+             noise_multiplier: The extra multiplier for DP-SGD noise.
+-            target_epsilon: The target privacy spending.
+-                Only used to estimate the `noise_multiplier` if it is not set.
+             target_delta: The target failure probability.
+                 Defaults to sample_size ** -1.1 if not set.
+             alphas: The RDP orders for (ε, δ)-DP conversion. Useless if not accounting in RDP.
+@@ -89,7 +89,7 @@ class PrivacyEngine(object):
+                 defaults to use parameters which require grad in module.
+             numerical_stability_constant: Small constant to avoid division by 0 when clipping.
+             clipping_mode: The clipping mode to use. One of 'default', 'ghost', 'per_layer', 'per_layer_percentile'.
+-            accounting_mode: The method of accounting privacy. One of (`rdp`, `glw`, `all`).
++            accounting_mode: The method of accounting privacy. One of (`rdp`, `all`).
+                 Meanings of shorthands:
+                     - rdp: Account loss with RDP but perform conversion to approx-DP with a procedure defined in
+                         "The Discrete Gaussian for Differential Privacy". https://arxiv.org/abs/2004.00010
+@@ -99,52 +99,50 @@ class PrivacyEngine(object):
+             eps_error: Error threshold for upper and lower bound in the GLW accounting procedure.
+             skip_checks: Skips the model type validation test if True.
+         """
++        if sample_size == 1000000:
++            print("sample_size if set to 1000000 by default, because we do not use the accounting from the private-transformers library. This value is not used.")
+         utils.handle_unused_kwargs(unused_kwargs)
+         del unused_kwargs
+         super(PrivacyEngine, self).__init__()
+-
++        print(f"initializing privacy engine on rank{rank}")
+         if clipping_mode not in ClippingMode.all():
+             raise ValueError(f"Unknown clipping mode {clipping_mode}. Expected one of {ClippingMode.all()}.")
+-        if accounting_mode not in AccountingMode.all():
+-            raise ValueError(f"Unknown accounting mode: {accounting_mode}. Expected one of {AccountingMode.all()}.")
+         if epochs <= 0.0:
+             raise ValueError(f"Number of training epochs cannot be non-positive, but found epochs={epochs}")
+ 
+         # Privacy parameters.
+         sample_rate = batch_size / sample_size
+         if target_delta is None:
+-            target_delta = sample_size ** -1.1
++            target_delta = sample_size ** -1
+         if noise_multiplier is None:
+-            if target_epsilon is None or epochs is None:
+-                raise ValueError(
+-                    f"`target_epsilon` and `epochs` must be specified when `noise_multiplier` is `None`."
+-                )
+-            if accounting_mode in ("rdp", "all"):
+-                manager = accounting_manager.RDPManager(alphas=alphas)
+-            else:  # "glw"
+-                manager = accounting_manager.GLWManager(eps_error=eps_error)
+-            noise_multiplier = manager.compute_sigma(
+-                target_epsilon=target_epsilon, target_delta=target_delta, sample_rate=sample_rate, epochs=epochs,
++            raise ValueError(
++                f"``noise_multiplier` must be specified."
+             )
++            manager = accounting_manager.RDPManager(alphas=alphas) #RDP
++
+ 
+         self.batch_size = batch_size
+         self.sample_size = sample_size
+         self.sample_rate = sample_rate
+         self.max_grad_norm = max_grad_norm
++        self.rank=rank
+ 
+         self.epochs = epochs
+         self.noise_multiplier = noise_multiplier
+         self.effective_noise_multiplier = noise_multiplier / batch_size
+-        self.target_epsilon = target_epsilon
+         self.target_delta = target_delta
+         self.alphas = alphas
+         self.eps_error = eps_error
+-        self.accounting_mode = accounting_mode
+         self.record_snr = record_snr
+ 
+         # Internals.
+         self.steps = 0  # Tracks privacy spending.
+ 
++        #amp
++        self.scaler = scaler
++        self.nb_nans = 0
++        self.amp_set_nans_to_zero = amp_set_nans_to_zero
++
+         # Recording.
+         self.max_clip = None
+         self.min_clip = None
+@@ -155,10 +153,16 @@ class PrivacyEngine(object):
+         self.noise_limit = None
+ 
+         # Record parameters.
+-        self.module = module
++        self.distributed = distributed
++        if not distributed:
++            self.DDP_module=None
++            self.module = module
++        else:
++            self.DDP_module=module
++            self.module = module.module
+         if named_params is None:
+             self.named_params = tuple(
+-                (name, param) for (name, param) in module.named_parameters() if param.requires_grad
++                (name, param) for (name, param) in self.module.named_parameters() if param.requires_grad
+             )
+         else:
+             self.named_params = named_params
+@@ -172,12 +176,12 @@ class PrivacyEngine(object):
+         else:
+             autograd_grad_sample.set_hooks_mode(BackwardHookMode.default)  # Extra guard.
+ 
+-        if not isinstance(module, SUPPORTED_TRANSFORMERS) and not skip_checks:
++        if not isinstance(self.module, SUPPORTED_TRANSFORMERS) and not skip_checks:
+             raise ValueError(
+-                f"Model type {type(module)} is not supported. Please file an issue if you want this model to be added.\n"
++                f"Model type {type(module.module)} is not supported. Please file an issue if you want this model to be added.\n"
+                 f"Currently supported transformers are: {SUPPORTED_TRANSFORMERS}"
+             )
+-        transformers_support.forward_swapper(module=module)  # Fix the position embeddings broadcast issue.
++        transformers_support.forward_swapper(module=self.module)  # Fix the position embeddings broadcast issue.
+ 
+     def lock(self):
+         """Run this after noisy clipped gradient is created to prevent tampering with it before parameter update."""
+@@ -198,9 +202,15 @@ class PrivacyEngine(object):
+         # Override step.
+         def dp_step(_self, **kwargs):
+             closure = kwargs.pop("closure", None)
+-
+             _self.privacy_engine.step(**kwargs)
+-            _self.original_step(closure=closure)
++            if self.distributed:
++                from opacus.distributed import average_gradients
++                average_gradients(self.module)
++            if _self.privacy_engine.scaler:
++                _self.privacy_engine.scaler.step(optimizer)
++                _self.privacy_engine.scaler.update()
++            else:
++                _self.original_step(closure=closure)
+             _self.privacy_engine.unlock()  # Only enable creating new grads once parameters are updated.
+             _self.privacy_engine.steps += 1
+ 
+@@ -216,7 +226,7 @@ class PrivacyEngine(object):
+         optimizer.privacy_engine = self
+ 
+         optimizer.original_step = optimizer.step
+-        optimizer.step = types.MethodType(dp_step, optimizer)
++        optimizer.dp_step = types.MethodType(dp_step, optimizer)
+ 
+         optimizer.original_zero_grad = optimizer.zero_grad
+         optimizer.zero_grad = types.MethodType(dp_zero_grad, optimizer)
+@@ -258,10 +268,8 @@ class PrivacyEngine(object):
+     def step(
+         self,
+         loss: torch.Tensor,
+-        scale=1.,
+         # Function that takes in named_params and does something.
+         # This option was included to help with another spectrum analysis project.
+-        callback: Optional[Callable] = None,
+     ):
+         if loss.dim() != 1:
+             raise ValueError(
+@@ -269,21 +277,17 @@ class PrivacyEngine(object):
+             )
+ 
+         if self.clipping_mode == ClippingMode.ghost:
+-            if callback is not None:
+-                raise ValueError("Ghost clipping does not support `callback` in `optimizer.step`.")
+-            if scale != 1.:
+-                raise ValueError("Ghost clipping does not support mixed-precision training.")
+             self._ghost_step(loss=loss)
+         else:
+-            self._step(loss=loss, scale=scale, callback=callback)
++            self._step(loss=loss, callback=callback)
+ 
+     @torch.no_grad()
+-    def virtual_step(self, loss: torch.Tensor, scale=1.):
++    def virtual_step(self, loss: torch.Tensor):
+         """Virtual step function when there's gradient accumulation."""
+         if self.clipping_mode == ClippingMode.ghost:
+             self._ghost_virtual_step(loss=loss)
+         else:
+-            self._virtual_step(loss=loss, scale=scale)
++            self._virtual_step(loss=loss)
+ 
+     def zero_grad(self, skip_grad=False):
+         for name, param in self.named_params:
+@@ -297,7 +301,7 @@ class PrivacyEngine(object):
+                 if hasattr(param, "grad"):
+                     del param.grad
+ 
+-    def _create_noisy_clipped_gradient(self):
++    def _create_noisy_clipped_gradient(self, upgrade=True):
+         """Create noisy clipped gradient for `optimizer.step`.
+ 
+         Add noise and scale by inverse batch size.
+@@ -319,11 +323,11 @@ class PrivacyEngine(object):
+ 
+             if self.record_snr:
+                 signals.append(param.grad.reshape(-1).norm(2))
+-
+-            if self.noise_multiplier > 0 and self.max_grad_norm > 0:
++            if self.noise_multiplier > 0 and self.max_grad_norm > 0 and self.rank==0 and upgrade:
++                scale = self.scaler.get_scale() if self.scaler else 1
+                 noise = torch.normal(
+                     mean=0,
+-                    std=self.noise_multiplier * self.max_grad_norm,
++                    std=self.noise_multiplier * self.max_grad_norm *scale,
+                     size=param.size(),
+                     device=param.device,
+                     dtype=param.dtype,
+@@ -332,7 +336,6 @@ class PrivacyEngine(object):
+                 if self.record_snr:
+                     noises.append(noise.reshape(-1).norm(2))
+                 del noise
+-
+             param.grad /= self.batch_size
+ 
+         if self.record_snr and len(noises) > 0:
+@@ -380,7 +383,10 @@ class PrivacyEngine(object):
+     def _double_backward(self, loss: torch.Tensor):
+         """Given per-example losses, backward twice to accumulate summed clipped gradients in `.grad`."""
+         first_loss = loss.sum()
+-        first_loss.backward(retain_graph=True)
++        if self.scaler:
++            self.scaler.scale(first_loss).backward(retain_graph=True)
++        else:
++            first_loss.backward(retain_graph=True)
+ 
+         # Prepare for second backward.
+         autograd_grad_sample.set_hooks_mode(BackwardHookMode.ghost_grad)
+@@ -393,7 +399,11 @@ class PrivacyEngine(object):
+ 
+         coef_sample = self.get_coef_sample()
+         second_loss = (coef_sample * loss).sum(dim=0)
+-        second_loss.backward()
++        
++        if self.scaler:
++            self.scaler.scale(second_loss).backward()
++        else:
++            second_loss.backward()
+ 
+         # Prepare for first backward (in the next round).
+         autograd_grad_sample.set_hooks_mode(BackwardHookMode.ghost_norm)
+@@ -401,18 +411,41 @@ class PrivacyEngine(object):
+     def get_coef_sample(self) -> torch.Tensor:
+         """Get per-example gradient scaling factor for clipping."""
+         norm_sample = self.get_norm_sample()
+-        return torch.clamp_max(self.max_grad_norm / (norm_sample + self.numerical_stability_constant), 1.)
++        scale = self.scaler.get_scale() if self.scaler else 1
++        aux = torch.clamp_max(self.max_grad_norm * scale / (norm_sample + self.numerical_stability_constant), 1.)
++        aux = torch.nan_to_num(aux, nan=float('nan'), posinf=float('nan'), neginf=float('nan'))
++        nans = aux.isnan().float().sum()
++        if nans > 0:
++            self.nb_nans += nans
++            print(f"number of nans in per sample norms: {nans}.")
++            if self.amp_set_nans_to_zero:
++                aux = torch.nan_to_num(aux, nan=0)
++                print(f"number of nans in per sample norms: {nans}. Replacing them by 0.")
++            else:
++                print(f"number of nans in per sample norms: {nans}. not replacing them to let the grad scaler decrease.")
++        return aux
+ 
+     def get_norm_sample(self) -> torch.Tensor:
+         """Get per-example gradient norms."""
+-        norm_sample = torch.stack([param.norm_sample for name, param in self.named_params], dim=0).norm(2, dim=0)
++        if self.scaler:
++            aux = torch.stack([param.norm_sample for name, param in self.named_params], dim=0)
++            nans = aux.isnan().float().mean()
++            infs=aux.isinf().float().mean()
++            if infs>0:
++                print(f"there were some inf values in per layer norm computation: {infs}. Switching them to NaNs")
++                aux = torch.nan_to_num(aux, nan=float('nan'), posinf=float('nan'), neginf=float('nan'))
++                assert aux.isinf().float().mean()==0
++            if infs + nans >0:
++                print(f"proportion of NaNs: {aux.isnan().float().mean()}")
++            norm_sample = aux.norm(2, dim=0)
++        else:
++            norm_sample = torch.stack([param.norm_sample for name, param in self.named_params], dim=0).norm(2, dim=0)
+         return norm_sample
+ 
+     # --- default clipping ---
+     def _step(
+         self,
+         loss,
+-        scale,
+         callback,
+     ):
+         """Create noisy gradients.
+@@ -427,13 +460,12 @@ class PrivacyEngine(object):
+ 
+         Args:
+             loss: The per-example loss; a 1-D tensor.
+-            scale: The loss up-scaling factor in amp. In full precision, this arg isn't useful.
+         """
+         if self._locked:  # Skip this gradient creation step if already created gradient and haven't stepped.
+             logging.warning("Attempted to step, but the engine is on lock.")
+             return
+ 
+-        norm_sample, coef_sample = self._accumulate_summed_grad(loss=loss, scale=scale)
++        norm_sample, coef_sample = self._accumulate_summed_grad(loss=loss)
+         # Collect stats for debugging.
+         self.max_clip = coef_sample.max().item()
+         self.min_clip = coef_sample.min().item()
+@@ -441,13 +473,13 @@ class PrivacyEngine(object):
+ 
+         if callback is not None:
+             callback(self)
+-        self._create_noisy_clipped_gradient()
++        self._create_noisy_clipped_gradient(upgrade=True)
+ 
+-    def _virtual_step(self, loss, scale):
+-        self._accumulate_summed_grad(loss=loss, scale=scale)
++    def _virtual_step(self, loss):
++        self._accumulate_summed_grad(loss=loss)
+ 
+     @torch.no_grad()
+-    def _accumulate_summed_grad(self, loss, scale):
++    def _accumulate_summed_grad(self, loss):
+         """Accumulate signal by summing clipped gradients.
+ 
+         Removes `.grad_sample` and `.grad` for each variable that requires grad at the end.
+@@ -492,7 +524,7 @@ class PrivacyEngine(object):
+             raise runtime_error
+ 
+         coef_sample = torch.clamp_max(
+-            self.max_grad_norm * scale / (norm_sample + self.numerical_stability_constant), 1.
++            self.max_grad_norm / (norm_sample + self.numerical_stability_constant), 1.
+         )
+         for name, param in self.named_params:
+             if not hasattr(param, 'summed_grad'):
+@@ -513,48 +545,26 @@ class PrivacyEngine(object):
+     def get_privacy_spent(
+         self,
+         steps: Optional[int] = None,
+-        accounting_mode: Optional[str] = None,
+         lenient=False
+     ) -> Dict:
+         if steps is None:
+             steps = self.steps
+-        if accounting_mode is None:
+-            accounting_mode = self.accounting_mode
+ 
+         privacy_results = {}  # Contains stats from all modes.
+-        if accounting_mode in (AccountingMode.all_, AccountingMode.rdp):
+-            try:
+-                manager = accounting_manager.RDPManager(alphas=self.alphas)
+-                privacy_results.update(
+-                    manager.compute_epsilon(
+-                        sigma=self.noise_multiplier,
+-                        sample_rate=self.sample_rate,
+-                        target_delta=self.target_delta,
+-                        steps=steps,
+-                    )
+-                )
+-            except Exception as err:
+-                logging.fatal("RDP accounting failed! Double check privacy parameters.")
+-                if not lenient:
+-                    raise err
+-
+-        if accounting_mode in (AccountingMode.all_, AccountingMode.glw):
+-            try:
+-                manager = accounting_manager.GLWManager(eps_error=self.eps_error)
+-                privacy_results.update(
+-                    manager.compute_epsilon(
+-                        sigma=self.noise_multiplier,
+-                        sample_rate=self.sample_rate,
+-                        target_delta=self.target_delta,
+-                        steps=steps
+-                    )
+-                )
+-            except Exception as err:
+-                logging.fatal(
+-                    "Numerical composition of tradeoff functions failed! Double check privacy parameters."
++        try:
++            manager = accounting_manager.RDPManager(alphas=self.alphas)
++            privacy_results.update(
++                manager.compute_epsilon(
++                    sigma=self.noise_multiplier,
++                    sample_rate=self.sample_rate,
++                    target_delta=self.target_delta,
++                    steps=steps,
+                 )
+-                if not lenient:
+-                    raise err
++            )
++        except Exception as err:
++            logging.fatal("RDP accounting failed! Double check privacy parameters.")
++            if not lenient:
++                raise err
+ 
+         return privacy_results
+ 
+@@ -573,7 +583,6 @@ class PrivacyEngine(object):
+     def __repr__(self):
+         return (
+             f"PrivacyEngine(\n"
+-            f"  target_epsilon={self.target_epsilon:.6f}, \n"
+             f"  target_delta={self.target_delta:.6f}, \n"
+             f"  noise_multiplier={self.noise_multiplier:.6f}, \n"
+             f"  effective_noise_multiplier={self.effective_noise_multiplier:.6f}, \n"
+@@ -581,7 +590,8 @@ class PrivacyEngine(object):
+             f"  max_grad_norm={self.max_grad_norm}, \n"
+             f"  sample_rate={self.sample_rate}, \n"
+             f"  batch_size={self.batch_size}, \n"
+-            f"  accounting_mode={self.accounting_mode}, \n"
+             f"  clipping_mode={self.clipping_mode}\n"
+             f")"
+         )
++
++
+diff --git a/private_transformers/settings.py b/private_transformers/settings.py
+index 79bfc2a..84e6c8a 100644
+--- a/private_transformers/settings.py
++++ b/private_transformers/settings.py
+@@ -33,8 +33,10 @@ class AccountingMode(metaclass=utils.ContainerMeta):
+     rdp = "rdp"
+     glw = "glw"
+     all_ = "all"
+-
+-
++import sys
++sys.path.insert(0, '../')
++import models_mae
++#import models_mae_img2text
+ SUPPORTED_TRANSFORMERS = (
+     transformers.models.openai.modeling_openai.OpenAIGPTLMHeadModel,
+     transformers.models.openai.modeling_openai.OpenAIGPTDoubleHeadsModel,
+@@ -49,4 +51,6 @@ SUPPORTED_TRANSFORMERS = (
+     transformers.models.vit.modeling_vit.ViTForImageClassification,
+     transformers.models.deit.modeling_deit.DeiTForImageClassification,
+     transformers.models.beit.modeling_beit.BeitForImageClassification,
++    models_mae.MaskedAutoencoderViT_autoregressive,
++    #models_mae_img2text.MaskedAutoencoderViT_autoregressive,
+ )
+diff --git a/private_transformers/supported_layers_grad_samplers.py b/private_transformers/supported_layers_grad_samplers.py
+index d2f1b5f..0fa0742 100644
+--- a/private_transformers/supported_layers_grad_samplers.py
++++ b/private_transformers/supported_layers_grad_samplers.py
+@@ -42,6 +42,7 @@ from .settings import BackwardHookMode
+ 
+ 
+ def sum_over_all_but_batch_and_last_n(tensor: torch.Tensor, n_dims: int) -> torch.Tensor:
++    tensor = tensor.to(torch.float32)
+     if tensor.dim() == n_dims + 1:
+         return tensor
+     else:
+@@ -50,6 +51,8 @@ def sum_over_all_but_batch_and_last_n(tensor: torch.Tensor, n_dims: int) -> torc
+ 
+ 
+ def _light_linear_weight_norm_sample(A, B) -> torch.Tensor:
++    A = A.to(torch.float32)
++    B = B.to(torch.float32)
+     """Compute gradient sample norm for the weight matrix in a linear layer."""
+     if A.dim() == 2 and B.dim() == 2:
+         return _light_linear_weight_norm_sample_non_sequential(A, B)
+@@ -66,6 +69,8 @@ def _light_linear_weight_norm_sample_sequential(A, B):
+     """
+     # TODO: This saves compute based on online dimension estimates. Downside is that it makes JIT impossible.
+     #  Think harder about better solutions.
++    A = A.to(torch.float32)
++    B = B.to(torch.float32)
+     (b, t, p), (_, _, d) = A.size(), B.size()
+     if 2 * t ** 2 < p * d:
+         return torch.sqrt((torch.bmm(A, A.transpose(-1, -2)) * torch.bmm(B, B.transpose(-1, -2))).sum(dim=(1, 2)))
+@@ -75,10 +80,13 @@ def _light_linear_weight_norm_sample_sequential(A, B):
+ 
+ def _light_linear_weight_norm_sample_non_sequential(A, B):
+     """The Goodfellow trick, i.e., Frobenius norm equal to product of 2-norms."""
++    A = A.to(torch.float32)
++    B = B.to(torch.float32)
+     return A.norm(2, dim=1) * B.norm(2, dim=1)
+ 
+ 
+ def _light_linear_bias_norm_sample(B):
++    B = B.to(torch.float32)
+     if B.dim() == 2:
+         return B.norm(2, dim=1)
+     elif B.dim() == 3:
+@@ -88,6 +96,7 @@ def _light_linear_bias_norm_sample(B):
+ 
+ 
+ def _create_or_extend_grad_sample(param: torch.Tensor, grad_sample: torch.Tensor) -> None:
++    
+     """Creates a ``grad_sample`` attribute in the given parameter or accumulate the existing tensor."""
+     if hasattr(param, "requires_grad") and not param.requires_grad:
+         return
+@@ -98,9 +107,9 @@ def _create_or_extend_grad_sample(param: torch.Tensor, grad_sample: torch.Tensor
+ 
+     # Warning: When a parameter with `grad_sample` is reused, the per-sample gradients are accumulated.
+     if hasattr(param, "grad_sample"):
+-        param.grad_sample += grad_sample.detach()
++        param.grad_sample += grad_sample.detach().to(torch.float32)
+     else:
+-        param.grad_sample = grad_sample.detach()
++        param.grad_sample = grad_sample.detach().to(torch.float32)
+ 
+ 
+ def _create_or_extend_norm_sample(param: torch.Tensor, norm_sample: torch.Tensor) -> None:
+@@ -127,12 +136,14 @@ def _compute_linear_grad_sample(layer: nn.Linear, A: Tuple[torch.Tensor], B: Tup
+     This function is written in an unusually bespoke way to avoid using `torch.einsum`.
+     """
+     (A,), (B,) = A, B  # Unpack singleton tuples.
++    A = A.to(torch.float32)
++    B = B.to(torch.float32)
+ 
+     if autograd_grad_sample.get_hooks_mode() == BackwardHookMode.ghost_norm:
+-        _create_or_extend_norm_sample(layer.weight, _light_linear_weight_norm_sample(A, B))
++        _create_or_extend_norm_sample(layer.weight.to(torch.float32), _light_linear_weight_norm_sample(A, B))
+ 
+         if layer.bias is not None:
+-            _create_or_extend_norm_sample(layer.bias, _light_linear_bias_norm_sample(B))
++            _create_or_extend_norm_sample(layer.bias.to(torch.float32), _light_linear_bias_norm_sample(B))
+     else:
+         if B.dim() == 3 and A.dim() == 3:
+             grad_weight = torch.bmm(B.permute(0, 2, 1), A)
+@@ -145,40 +156,44 @@ def _compute_linear_grad_sample(layer: nn.Linear, A: Tuple[torch.Tensor], B: Tup
+                 f"Expected both grad_output and input to have dimension 2 or 3, "
+                 f"but found len(grad_output.dim())={len(B.dim())}, len(input.dim())={len(A.dim())}"
+             )
+-        _create_or_extend_grad_sample(layer.weight, grad_weight)
++        _create_or_extend_grad_sample(layer.weight.to(torch.float32), grad_weight.to(torch.float32))
+ 
+         if layer.bias is not None:
+-            _create_or_extend_grad_sample(layer.bias, grad_bias)
++            _create_or_extend_grad_sample(layer.bias.to(torch.float32), grad_bias.to(torch.float32))
+ 
+ 
+ def _compute_layer_norm_grad_sample(layer: nn.LayerNorm, A: Tuple[torch.Tensor], B: Tuple[torch.Tensor]) -> None:
+     """Computes per sample gradients for `nn.LayerNorm` layer."""
+     (A,), (B,) = A, B  # Unpack singleton tuples.
++    A = A.to(torch.float32)
++    B = B.to(torch.float32)
+ 
+     is_backward_ghost_norm = autograd_grad_sample.get_hooks_mode() == BackwardHookMode.ghost_norm
+ 
+     grad_sample = sum_over_all_but_batch_and_last_n(
+-        F.layer_norm(A, layer.normalized_shape, eps=layer.eps) * B,
++        F.layer_norm(A, layer.normalized_shape, eps=layer.eps*10) * B,#try*10 eps
+         layer.weight.dim(),
+     )
+     if is_backward_ghost_norm:
+         norm_sample = grad_sample.flatten(start_dim=1).norm(2, dim=1)
+-        _create_or_extend_norm_sample(layer.weight, norm_sample)
++        _create_or_extend_norm_sample(layer.weight.to(torch.float32), norm_sample)
+     else:
+-        _create_or_extend_grad_sample(layer.weight, grad_sample)
++        _create_or_extend_grad_sample(layer.weight.to(torch.float32), grad_sample)
+ 
+-    grad_sample = sum_over_all_but_batch_and_last_n(B, layer.bias.dim())
++    grad_sample = sum_over_all_but_batch_and_last_n(B, layer.bias.dim()).to(torch.float32)
+     if is_backward_ghost_norm:
+         norm_sample = grad_sample.flatten(start_dim=1).norm(2, dim=1)
+-        _create_or_extend_norm_sample(layer.bias, norm_sample)
++        _create_or_extend_norm_sample(layer.bias.to(torch.float32), norm_sample)
+     else:
+-        _create_or_extend_grad_sample(layer.bias, grad_sample)
++        _create_or_extend_grad_sample(layer.bias.to(torch.float32), grad_sample)
+ 
+ 
+ def _compute_embedding_grad_sample(layer: nn.Embedding, A: Tuple[torch.Tensor], B: Tuple[torch.Tensor]) -> None:
+     """Computes per sample gradients for `nn.Embedding` layer."""
+     # `nn.Embedding` has single input and output. Unpack singleton tuples.
+     (A,), (B,) = A, B
++    A = A.to(torch.float32)
++    B = B.to(torch.float32)
+ 
+     if autograd_grad_sample.get_hooks_mode() == BackwardHookMode.ghost_norm:
+         not_AAt: torch.Tensor = ~A[:, :, None].eq(A[:, None, :])
+@@ -192,7 +207,7 @@ def _compute_embedding_grad_sample(layer: nn.Embedding, A: Tuple[torch.Tensor],
+             #   So the entry gets cleared whenever one of A, A^t takes the padding idx.
+             not_AAt.bitwise_or_((A[:, :, None] == padding_idx) | (A[:, None, :] == padding_idx))
+         norm_sample = torch.sqrt((torch.bmm(B, B.transpose(-1, -2)).masked_fill(not_AAt, 0)).sum(dim=(1, 2)))
+-        _create_or_extend_norm_sample(layer.weight, norm_sample)
++        _create_or_extend_norm_sample(layer.weight.to(torch.float32), norm_sample)
+     else:
+         A_dense = F.one_hot(A, num_classes=layer.weight.shape[0]).to(B)  # (batch_size, seq_len, vocab_dim,)
+         grad_sample = torch.bmm(A_dense.permute(0, 2, 1), B)
+@@ -201,7 +216,7 @@ def _compute_embedding_grad_sample(layer: nn.Embedding, A: Tuple[torch.Tensor],
+         if layer.padding_idx is not None:
+             # `grad_sample` has size (batch_size, num_vocab, embedding_dim).
+             grad_sample[:, layer.padding_idx, :] = 0.
+-        _create_or_extend_grad_sample(layer.weight, grad_sample)
++        _create_or_extend_grad_sample(layer.weight.to(torch.float32), grad_sample)
+ 
+ 
+ def _custom_compute_conv1d_grad_sample(layer: nn.Linear, A: Tuple[torch.Tensor], B: Tuple[torch.Tensor]):
+@@ -209,23 +224,27 @@ def _custom_compute_conv1d_grad_sample(layer: nn.Linear, A: Tuple[torch.Tensor],
+     # `transformers.modeling_utils.Conv1D` has single input and output. Unpack singleton tuples.
+     # https://github.com/huggingface/transformers/blob/ccc089780415445768bcfd3ac4418cec20353484/src/transformers/pytorch_utils.py#L107
+     (A,), (B,) = A, B
++    A = A.to(torch.float32)
++    B = B.to(torch.float32)
+ 
+     if autograd_grad_sample.get_hooks_mode() == BackwardHookMode.ghost_norm:
+-        _create_or_extend_norm_sample(layer.weight, _light_linear_weight_norm_sample(A, B))
++        _create_or_extend_norm_sample(layer.weight.to(torch.float32), _light_linear_weight_norm_sample(A, B))
+ 
+         if layer.bias is not None:
+-            _create_or_extend_norm_sample(layer.bias, B.sum(dim=1).norm(2, dim=1))
++            _create_or_extend_norm_sample(layer.bias.to(torch.float32), B.sum(dim=1).norm(2, dim=1))
+     else:
+-        _create_or_extend_grad_sample(layer.weight, torch.bmm(A.permute(0, 2, 1), B))
++        _create_or_extend_grad_sample(layer.weight.to(torch.float32), torch.bmm(A.permute(0, 2, 1), B))
+ 
+         if layer.bias is not None:
+-            _create_or_extend_grad_sample(layer.bias, B.sum(dim=1))
++            _create_or_extend_grad_sample(layer.bias.to(torch.float32), B.sum(dim=1))
+ 
+ 
+ def _compute_t5_layer_norm_grad_sample(layer: T5LayerNorm, A: Tuple[torch.Tensor], B: Tuple[torch.Tensor]):
+     # `transformers.models.t5.modeling_t5.T5LayerNorm` has single input and output. Unpack singleton tuples.
+     # https://github.com/huggingface/transformers/blob/ccc089780415445768bcfd3ac4418cec20353484/src/transformers/models/t5/modeling_t5.py#L248
+     (A,), (B,) = A, B
++    A = A.to(torch.float32)
++    B = B.to(torch.float32)
+ 
+     assert A.dim() == 3 and B.dim() == 3, (
+         "Internal error: T5LayerNorm receiving 2-D tensors, but expected 3-D tensors (sequential inputs)."
+@@ -235,10 +254,10 @@ def _compute_t5_layer_norm_grad_sample(layer: T5LayerNorm, A: Tuple[torch.Tensor
+ 
+     grad_sample = (A * torch.rsqrt(A.pow(2).mean(-1, keepdim=True) + layer.variance_epsilon) * B).sum(dim=1)
+     if is_backward_ghost_norm:
+-        norm_sample = grad_sample.norm(2, dim=1)
+-        _create_or_extend_norm_sample(layer.weight, norm_sample)
++        norm_sample = grad_sample.to(torch.float32).norm(2, dim=1)
++        _create_or_extend_norm_sample(layer.weight.to(torch.float32), norm_sample)
+     else:
+-        _create_or_extend_grad_sample(layer.weight, grad_sample)
++        _create_or_extend_grad_sample(layer.weight.to(torch.float32), grad_sample.to(torch.float32))
+ 
+ 
+ def _compute_opt_learned_positional_embedding_grad_sample(
+@@ -247,6 +266,8 @@ def _compute_opt_learned_positional_embedding_grad_sample(
+     # `transformers.models.opt.modeling_opt.OPTLearnedPositionalEmbedding` has two inputs and one output.
+     # https://github.com/huggingface/transformers/blob/d0acc9537829e7d067edbb791473bbceb2ecf056/src/transformers/models/opt/modeling_opt.py#L99
+     (A, past_key_values_length), (B,) = A, B  # Unpack tuples.
++    A = A.to(torch.float32)
++    B = B.to(torch.float32)
+ 
+     attention_mask = A.long()
+ 
+@@ -274,7 +295,7 @@ def unfold2d(
+     H_effective = (H + 2 * padding[0] - (kernel_size[0] + (kernel_size[0] - 1) * (dilation[0] - 1))) // stride[0] + 1
+     W_effective = (W + 2 * padding[1] - (kernel_size[1] + (kernel_size[1] - 1) * (dilation[1] - 1))) // stride[1] + 1
+     # F.pad's first argument is the padding of the *last* dimension
+-    input = F.pad(input, (padding[1], padding[1], padding[0], padding[0]))
++    input = F.pad(input.to(torch.float32), (padding[1], padding[1], padding[0], padding[0]))
+     *shape_pad, H_pad, W_pad = input.shape
+     strides = list(input.stride())
+     strides = strides[:-2] + [
+@@ -285,7 +306,7 @@ def unfold2d(
+     ]
+     out = input.as_strided(
+         shape + [kernel_size[0], kernel_size[1], H_effective, W_effective], strides
+-    )
++    ).to(torch.float32)
+ 
+     return out.reshape(input.size(0), -1, H_effective * W_effective)
+ 
+@@ -293,6 +314,8 @@ def unfold2d(
+ def _compute_conv2d_grad_sample(layer: nn.Conv2d, activations: Tuple[torch.Tensor], backprops: Tuple[torch.Tensor]):
+     # `nn.Conv2d` has one input and one output. Unpack tuples.
+     (activations,), (backprops,) = activations, backprops
++    activations = activations.to(torch.float32)
++    backprops = backprops.to(torch.float32)
+ 
+     n = activations.shape[0]
+     activations = unfold2d(
+@@ -303,9 +326,9 @@ def _compute_conv2d_grad_sample(layer: nn.Conv2d, activations: Tuple[torch.Tenso
+     if autograd_grad_sample.get_hooks_mode() == BackwardHookMode.ghost_norm:
+         activations = activations.permute(0, 2, 1)
+         backprops = backprops.permute(0, 2, 1)
+-        _create_or_extend_norm_sample(layer.weight, _light_linear_weight_norm_sample(activations, backprops))
++        _create_or_extend_norm_sample(layer.weight.to(torch.float32), _light_linear_weight_norm_sample(activations, backprops))
+         if layer.bias is not None:
+-            _create_or_extend_norm_sample(layer.bias, _light_linear_bias_norm_sample(backprops))
++            _create_or_extend_norm_sample(layer.bias.to(torch.float32), _light_linear_bias_norm_sample(backprops))
+     else:
+         # n=batch_sz; o=num_out_channels; p=(num_in_channels/groups)*kernel_sz
+         grad_sample = contract("noq,npq->nop", backprops, activations)
+@@ -320,11 +343,11 @@ def _compute_conv2d_grad_sample(layer: nn.Conv2d, activations: Tuple[torch.Tenso
+         )
+         grad_sample = contract("ngrg...->ngr...", grad_sample).contiguous()
+         grad_weight = grad_sample.view([n] + list(layer.weight.shape))
+-        _create_or_extend_grad_sample(layer.weight, grad_weight)
++        _create_or_extend_grad_sample(layer.weight.to(torch.float32), grad_weight.to(torch.float32))
+ 
+         if layer.bias is not None:
+             grad_bias = torch.sum(backprops, dim=2)
+-            _create_or_extend_grad_sample(layer.bias, grad_bias)
++            _create_or_extend_grad_sample(layer.bias.to(torch.float32), grad_bias.to(torch.float32))
+ 
+ 
+ _supported_layers_grad_samplers = {

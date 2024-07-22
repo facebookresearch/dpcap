@@ -1,0 +1,6 @@
+timm==0.9.2
+einops==0.8.0
+opacus==1.4.1
+webdataset==0.2.86
+dask==2023.5.0
+submitit==1.4.5

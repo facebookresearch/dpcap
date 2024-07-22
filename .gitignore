@@ -1,0 +1,9 @@
+.pytest_cache/
+__pycache__/
+demo/
+figs/
+mae_finetuning/data/
+mae_finetuning/Caltech101/
+output_dir/
+trash/
+msn/imagenet_subsets1/subset10.txt

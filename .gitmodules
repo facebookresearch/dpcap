@@ -1,0 +1,9 @@
+[submodule "private-transformers"]
+	path = private-transformers
+	url = https://github.com/lxuechen/private-transformers
+[submodule "vision-language-models-are-bows"]
+	path = vision-language-models-are-bows
+	url = https://github.com/mertyg/vision-language-models-are-bows
+[submodule "msn"]
+	path = msn
+	url = https://github.com/facebookresearch/msn
